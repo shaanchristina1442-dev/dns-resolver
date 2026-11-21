@@ -64,3 +64,41 @@ MAX_STEPS = 30
 MAX_DEPTH = 8
 
 
+class ResolverError(Exception):
+    pass
+
+
+@dataclass
+
+class Record:
+    name: str
+    rtype: int
+    rclass: int
+    ttl: int
+    data: str
+
+    def __str__(self) -> str:
+        t = TYPE_NAMES.get(self.rtype, str(self.type))
+        return f"{self.name:<30} {self.tlt:>6} {t:<5} {self.data}"
+
+@dataclass 
+class Message:
+    id: int
+    flags: int
+    questions: list[tuple[str, int, int]] = field(default_factory=list)
+    answers: list[Record] = field(default_factory=list)
+    authority: list[Record] = field(default_factory=list)
+    additional: list[Record] = field(default_factory=list)
+
+    @property
+    def rcode(self) -> str:
+        return self.flags & 0x000F
+
+    @property
+    def trunacates(self) -> bool:
+        return bool(self.flags & 0x0200)
+
+    @property 
+    def authorize(self) -> bool:
+        return bool(self.flags & 0x0400)
+
