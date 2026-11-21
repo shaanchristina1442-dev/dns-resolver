@@ -102,3 +102,29 @@ class Message:
     def authorize(self) -> bool:
         return bool(self.flags & 0x0400)
 
+
+def encode_name(name: str) -> bytes:
+    """'www.example.com' -> b'\\x03www\\x07example\\x03com\\x00'"""
+    out = b""
+
+    for label in name.rstrip(".").split("."):
+        if not label:
+            continue
+        raw = label.encode("idna")
+        if len(raw) > 63:
+            raise ValueError(f"label is too long: {label!r}")
+
+        out += bytes([len(raw)]) + raw
+
+    return out + b"\x00"
+
+def build_Query(name: str, qType: int) -> tuple[int, bytes]:
+    """Build a DNS query packet. Returns (transaction_id, packet)."""
+    qid = random.randint(0, 0xFFFF)
+    flags = 0x0000
+
+    header = struct.pack("!HHHHH", qid, flags, 1, 0, 0, 0)
+    question = encode_name(name) + struct.pack("!HH", qtype, CLASS_IN)
+    return qid, header + questions
+
+# im stopping here for tonight, lets get mad high now
