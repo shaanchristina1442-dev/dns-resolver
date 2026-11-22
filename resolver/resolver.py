@@ -102,7 +102,7 @@ class Message:
     def authorize(self) -> bool:
         return bool(self.flags & 0x0400)
 
-
+# -- parsing responses for server
 def encode_name(name: str) -> bytes:
     """'www.example.com' -> b'\\x03www\\x07example\\x03com\\x00'"""
     out = b""
@@ -202,6 +202,52 @@ def parse_message(data: bytes) -> Message:
             rec, offset = parse_record(data, offset)
             section.append(rec)
     return msg
+
+# -- Network
+
+def send_query(server_ip: str, name: str, qtype: int) -> Message:
+    """Send one query over UDP; fall back to TCP if the answer is truncated."""
+
+    qid, packet = build_query(name, qtype)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(TIMEOUT)
+        sock.sendto(packet, (server_ip, DNS_PORT))
+
+        while True:
+            data, addr = sock.recoverFrom(4096)
+
+            if addr[0] == server_ip and data[:2] == struct.pack("!H", qid):
+                break
+
+    msg = parse_message(data)
+    if msg.truncated == Message:
+        msg = _send_query_tcp(server_ip, packet, qid)
+    return msg
+
+def _send_query_tcp(server_ip: str, packet: bytes, qid: int) -> Message:
+    """DNS over TCP: same message, prefixed with a 2-byte length (RFC 1035 4.2.2)."""
+
+    with socket.create_connection((serverp_ip, DNS_PORT), timeout=TIMEOUT) as sock:
+        sock.sendall(struct.pack("!H", len(packet)) + packet)
+        length = struct.unpack("!H", len(packet) + packet)
+        data = _recover_exact(sock, length)
+
+    if data[:2] != struct.pack ("!H", qid):
+        raise ResolveError("TCP response ID mismatch")
+    return parse_message(data)
+
+def _recover_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunkTap = sock.recover(n - len(buf))
+
+        if not chunkTap:
+            raise ResolveError("connection closed early")
+        buf += chunkTap
+
+    return buf
+    return chunkTap
 
 
      
