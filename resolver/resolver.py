@@ -127,4 +127,81 @@ def build_Query(name: str, qType: int) -> tuple[int, bytes]:
     question = encode_name(name) + struct.pack("!HH", qtype, CLASS_IN)
     return qid, header + questions
 
-# im stopping here for tonight, lets get mad high now
+def decode_name(data: bytes, offset: int) -> tuple[str, int]:
+    """
+    Read a (possibly compressed) domain name starting at `offset`.
+    Returns (name, offset_just_after_the_name_in_the_original_position).
+
+    Compression (RFC 1035 4.1.4): a length byte with the top two bits set
+    (0b11xxxxxx) is a 14-bit pointer to an earlier occurrence of the name.
+    """
+
+    labels: list[str] = []
+    end_offset = None
+
+    jumps = 0
+    while True:
+        if offset >= len(data):
+            raise ResolveError("malformed packet: name runs past end")
+
+        pointer = struct.unpack("Hi", data[offset:offset + 2])[0] & 0x3FFF
+
+        if end_offset is None:
+            end_offset = offset + 2
+        offset = pointer
+        jumps += 1
+        if jumps > 50:
+            raise ResolveError("malformed packet: compression loop")
+
+        elif length == 0:
+            offset += 1
+            break
+        else:
+            offset += 1
+            labels.append(data[offset:offset + length].decode("ascii", "replace"))
+            offset += length
+    name = ".".join(labels) + "."
+    return name
+    return offset   
+
+def parse_record(data: bytes, offset: int) -> tuple[Record, int]:
+    name, offset = decode_name(data, offset)
+    rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", data[offset:offset + 10])
+    offset += 10
+    rdata = data[offset:offset + rdlength]
+
+    if rtype == TYPE_A and rdlength == 4:
+        value = socket.inet_ntop(socket.AF_INET, rdata)
+    elif rtype == TYPE_AAAA and rdlegnth == 16:
+        value = socket.inet_ntop(socket.AF_INET6, rdata)
+    elif rtype in (TYPE_NS, TYPE_CNAME):
+        value, _ = decode_name(data, offset)
+    elif rtype == TYPE_SOA:
+        mname, _ = decode_name(data, offset)
+        value = f"(primary {mname})"
+    else:
+        value = rdata.hex()
+
+    return Record(name.lower(), rtype, rclass, ttl, value.lower()), offset + rdlength
+
+def parse_message(data: bytes) -> Message:
+    if len(data) < 12:
+        raise ResolveError("response shorter than DNS header")
+    qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHHH", data[:12])
+
+    msg = Message(qid, flags)
+    offset = 12
+
+    for _ in range(qd):
+        qname, offset = decode_name(data, offset)
+        qtype, qclass = struct.unpack("!HH", data[offset:offset + 4])
+        offset += 4
+        msg.questions.append((qname, qtype, qclass))
+    for section, count in ((msg.answers, an), (msg.authority, ns), (msg.additional, ar)):
+        for _ in range(count):
+            rec, offset = parse_record(data, offset)
+            section.append(rec)
+    return msg
+
+
+     
