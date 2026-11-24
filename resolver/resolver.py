@@ -249,5 +249,55 @@ def _recover_exact(sock: socket.socket, n: int) -> bytes:
     return buf
     return chunkTap
 
+# stopping here for tonight, we got the networks and the parsing functions done tonight. 
 
-     
+# the algorithm that iterates through responses to get the resolution
+
+class Resolver:
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+        self.queries_sent = 0
+
+    def log(self, depth: int, text: str = "") -> None:
+        if self.verbose:
+            print("   " * depth + text)
+
+    def resolve(self, hostname: str, qtype: int = TYPE_A, depth: int = 0) -> list[str]:
+        """Resolve `hostname` to a list of addresses by walking down from the root."""
+        if depth > MAX_DEPTH:
+            raise ResolveError("too much recursion (CNAME / glueless NS chain too long)")
+
+        name = hostname.lower().rstrip(".") + "."
+
+        servers= list(ROOT_SERVERS.items())
+        random.shuffle(servers)
+        zone = "."
+
+        for step in range(1, MAX_STEPS + 1):
+            response, (server_name, server_ip) = self._query_any(servers, name, qtype, depth)
+            self.log(depth, f"[{step}] Asked {server_name} ({server_ip}), "
+                            f"a server for zone '{zone}', about {name} "
+                            f"{TYPE_NAMES[qtype]}")
+            if response.rcode == 3:
+                hint = ""
+                if zone == "." and response.flags & 0x0080 and not response.authority:
+                    hint = ("\n  Hint: this reply did not come from a real root server. "
+                            "Your network (firewall, VPN, campus/hotel Wi-Fi, sandbox) "
+                            "is intercepting DNS on port 53. Try another network.")
+                raise ResolveError(f"{name} does not exist (NXDOMAIN from {server_name}){hint}")
+            if response.rcode != 0:
+                hint = " "
+                if zone == "." and response.flags & 0x0080 and not response.authority:
+                    hint = ("\n Hint: this reply did not come from a real root server. "  "Your network (firewall, VPN, campus/hotel Wi-Fi, sandbox) "
+                            "is intercepting DNS on port 53. Try another network.")
+                raise ResolveError(f"{name} doesnt exist (NXDOMAIN from {server_name}){hint}")
+
+            if response.rcode != 0:
+                self.log(depth, f" {RCODE_NAMES.get(response.rcode)} - trying another server")
+                servers = [s for s in servers if s[1] != server_ip]
+                if not servers:
+                    raise ResolveError(f"allservers for '{zone}' failed")
+                continue
+
+# Our cases for the test the alforithm 
+            
