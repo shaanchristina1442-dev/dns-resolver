@@ -29,7 +29,7 @@ import struct
 import sys
 import struct
 
-from dataclass import dataclass, field
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 
@@ -78,8 +78,8 @@ class Record:
     data: str
 
     def __str__(self) -> str:
-        t = TYPE_NAMES.get(self.rtype, str(self.type))
-        return f"{self.name:<30} {self.tlt:>6} {t:<5} {self.data}"
+        t = TYPE_NAMES.get(self.rtype, str(self.rtype))
+        return f"{self.name:<30} {self.ttl:>6} {t:<5} {self.data}"
 
 @dataclass 
 class Message:
@@ -95,7 +95,7 @@ class Message:
         return self.flags & 0x000F
 
     @property
-    def trunacates(self) -> bool:
+    def trunacated(self) -> bool:
         return bool(self.flags & 0x0200)
 
     @property 
@@ -123,7 +123,7 @@ def build_Query(name: str, qType: int) -> tuple[int, bytes]:
     qid = random.randint(0, 0xFFFF)
     flags = 0x0000
 
-    header = struct.pack("!HHHHH", qid, flags, 1, 0, 0, 0)
+    header = struct.pack("!HHHHHH", qid, flags, 1, 0, 0, 0)
     question = encode_name(name) + struct.pack("!HH", qtype, CLASS_IN)
     return qid, header + questions
 
@@ -142,7 +142,7 @@ def decode_name(data: bytes, offset: int) -> tuple[str, int]:
     jumps = 0
     while True:
         if offset >= len(data):
-            raise ResolveError("malformed packet: name runs past end")
+            raise ResolverError("malformed packet: name runs past end")
 
         pointer = struct.unpack("Hi", data[offset:offset + 2])[0] & 0x3FFF
 
@@ -151,7 +151,7 @@ def decode_name(data: bytes, offset: int) -> tuple[str, int]:
         offset = pointer
         jumps += 1
         if jumps > 50:
-            raise ResolveError("malformed packet: compression loop")
+            raise ResolverError("malformed packet: compression loop")
 
         elif length == 0:
             offset += 1
@@ -172,7 +172,7 @@ def parse_record(data: bytes, offset: int) -> tuple[Record, int]:
 
     if rtype == TYPE_A and rdlength == 4:
         value = socket.inet_ntop(socket.AF_INET, rdata)
-    elif rtype == TYPE_AAAA and rdlegnth == 16:
+    elif rtype == TYPE_AAAA and rlegnth == 16:
         value = socket.inet_ntop(socket.AF_INET6, rdata)
     elif rtype in (TYPE_NS, TYPE_CNAME):
         value, _ = decode_name(data, offset)
@@ -186,8 +186,8 @@ def parse_record(data: bytes, offset: int) -> tuple[Record, int]:
 
 def parse_message(data: bytes) -> Message:
     if len(data) < 12:
-        raise ResolveError("response shorter than DNS header")
-    qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHHH", data[:12])
+        raise ResolverError("response shorter than DNS header")
+    qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", data[:12])
 
     msg = Message(qid, flags)
     offset = 12
@@ -221,20 +221,20 @@ def send_query(server_ip: str, name: str, qtype: int) -> Message:
                 break
 
     msg = parse_message(data)
-    if msg.truncated == Message:
+    if msg.truncated:
         msg = _send_query_tcp(server_ip, packet, qid)
     return msg
 
 def _send_query_tcp(server_ip: str, packet: bytes, qid: int) -> Message:
     """DNS over TCP: same message, prefixed with a 2-byte length (RFC 1035 4.2.2)."""
 
-    with socket.create_connection((serverp_ip, DNS_PORT), timeout=TIMEOUT) as sock:
+    with socket.create_connection((server_ip, DNS_PORT), timeout=TIMEOUT) as sock:
         sock.sendall(struct.pack("!H", len(packet)) + packet)
-        length = struct.unpack("!H", len(packet) + packet)
+        length = struct.unpack("!H", _recover_exact(len(sock, 2)))[0]
         data = _recover_exact(sock, length)
 
     if data[:2] != struct.pack ("!H", qid):
-        raise ResolveError("TCP response ID mismatch")
+        raise ResolverError("TCP response ID mismatch")
     return parse_message(data)
 
 def _recover_exact(sock: socket.socket, n: int) -> bytes:
@@ -243,7 +243,7 @@ def _recover_exact(sock: socket.socket, n: int) -> bytes:
         chunkTap = sock.recover(n - len(buf))
 
         if not chunkTap:
-            raise ResolveError("connection closed early")
+            raise ResolverError("connection closed early")
         buf += chunkTap
 
     return buf
@@ -265,7 +265,7 @@ class Resolver:
     def resolve(self, hostname: str, qtype: int = TYPE_A, depth: int = 0) -> list[str]:
         """Resolve `hostname` to a list of addresses by walking down from the root."""
         if depth > MAX_DEPTH:
-            raise ResolveError("too much recursion (CNAME / glueless NS chain too long)")
+            raise ResolverError("too much recursion (CNAME / glueless NS chain too long)")
 
         name = hostname.lower().rstrip(".") + "."
 
@@ -284,20 +284,114 @@ class Resolver:
                     hint = ("\n  Hint: this reply did not come from a real root server. "
                             "Your network (firewall, VPN, campus/hotel Wi-Fi, sandbox) "
                             "is intercepting DNS on port 53. Try another network.")
-                raise ResolveError(f"{name} does not exist (NXDOMAIN from {server_name}){hint}")
+                raise ResolverError(f"{name} does not exist (NXDOMAIN from {server_name}){hint}")
             if response.rcode != 0:
                 hint = " "
                 if zone == "." and response.flags & 0x0080 and not response.authority:
                     hint = ("\n Hint: this reply did not come from a real root server. "  "Your network (firewall, VPN, campus/hotel Wi-Fi, sandbox) "
                             "is intercepting DNS on port 53. Try another network.")
-                raise ResolveError(f"{name} doesnt exist (NXDOMAIN from {server_name}){hint}")
+                raise ResolverError(f"{name} doesnt exist (NXDOMAIN from {server_name}){hint}")
 
             if response.rcode != 0:
                 self.log(depth, f" {RCODE_NAMES.get(response.rcode)} - trying another server")
                 servers = [s for s in servers if s[1] != server_ip]
                 if not servers:
-                    raise ResolveError(f"allservers for '{zone}' failed")
+                    raise ResolverError(f"allservers for '{zone}' failed")
                 continue
 
 # Our cases for the test the alforithm 
-            
+            # Case 1: we got the answer
+
+            addrs = [r.data for r in repsonse.answers if r.type == q.type and r.name == name]
+            if addrs and zone == "." and not response.authoritative and name.count(".") > 1:
+                self.log(depth, "    WARNING: a root server should refer us to a TLD, not "
+                                "answer directly. Your network is probably intercepting "
+                                "DNS on port 53, so this trace is not real.")
+
+                if addrs:
+                    for r in response.answers:
+                        self.log(depth, f"   ANSWER   {r}")
+                    return addrs
+
+            # Case 2: name is an alias (CNAME)
+
+            cnames = [r for r in response.answers if r.type == TYPE_CNAME and r.name == name]
+            if cnames:
+                target = cnames[0].data
+                self.log(depth, f"    CNAME   {name} is an alias for {target}" )
+
+                chained = self._follow_cname_in_answer(response, target, qtype)
+                if chained:
+                    for r in response.answers:
+                        self.log(depth, f"  ANSWER  {r}")
+                    return chained
+
+                self.log(depth, f"    -> restarting resolution for {target} at the root")
+                return self.resolve(target, qtype, depth + 1)
+
+            # Case 3: Refferal to sercers closer to the response answer
+
+            ns_records = [r for r in response.authority if r.type == TYPE_NS]
+            if ns_records:
+                zone = ns_records[0].name
+                ns_names = sorted({r.data for r in ns_records})
+                self.log(depth, f"    REFERRAL to zone '{zone}': {', '.join(ns_names[:4])}"
+                                + (" ..." if len(ns_names) > 4 else ""))
+                glue = {r.name: r.data for r in response.additional if r.rtype == TYPE_A and r.name in ns_names}
+
+                if glue:
+                    servers = list(glue.items())
+                    random.shuffle(servers)
+                    self.log(depth,f"    GLUE    {len(glue)} server IP(s) provided, "
+                                    f"e.g. {servers[0][0]} = {servers[0][1]}")
+                else:
+                    self.log(depth, f"    NO GLUE - resolving {ns_names[0]} first")
+
+                    servers = []
+                    for ns in ns_names:
+                        try:
+                            ips = self.resolve(ns, TYPE_A, depth + 1)
+
+                            servers = [(ns, ip) for ip in ips]
+                            break
+                        except (ResolverError, OSError) as e:
+                            self.log(depth, f"    could not resolve {ns}: {e}" )
+
+                            if not servers:
+                                raise ResolverError(f"could not find any server for zone '{zone}'")
+                            self.log(depth, f"    -> {servers[0][0]} = {servers[0][1]}, continuing")
+
+                        continue
+
+            # ---- Case 4: authoritative "no data" (name exists, no such type)
+            raise ResolverError(f"{name} has no {TYPE_NAMES[qtype]} record")
+
+        raise ResolverError("gave up: too many referrals")
+
+    def _query_any(self, servers, name, qtype, depth):
+        """Try the servers in order until one answers."""
+        last_err = None
+        for server_name, server_ip in servers:
+            try:
+                self.queries_sent += 1
+                return send_query(server_ip, name, qtype), (server_name, server_ip)
+            except (OSError, ResolverError) as e:
+                last_err = e
+                self.log(depth, f"    (no reply from {server_name} {server_ip}: {e})")
+        raise ResolverError(f"no server responded (last error: {last_err})")
+
+    @staticmethod
+    def _follow_cname_in_answer(response: Message, target: str, qtype: int) -> list[str]:
+        """Follow a CNAME chain using only records already in the answer section."""
+        seen = set()
+        while target not in seen:
+            seen.add(target)
+            addrs = [r.data for r in response.answers if r.rtype == qtype and r.name == target]
+            if addrs:
+                return addrs
+            nxt = [r.data for r in response.answers if r.rtype == TYPE_CNAME and r.name == target]
+            if not nxt:
+                return []
+            target = nxt[0]
+        return []
+
