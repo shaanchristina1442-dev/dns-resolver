@@ -395,3 +395,36 @@ class Resolver:
             target = nxt[0]
         return []
 
+## Verificication to prove the IP really serves this site. 
+
+def verify_https(hostname: str, ip: str) -> bool:
+    """
+    Connect to `ip` directly (no DNS involved), do a TLS handshake that asks for
+    `hostname`, and make an HTTP request. If the server presents a certificate
+    valid for `hostname` that chains to a trusted CA, the IP genuinely belongs
+    to that site.
+    """
+
+    print(f"\nVerifying: connecting straight to {ip}:443 and asking for {hostname}")
+
+    ctx = ssl.create_default_context()
+
+    try:
+        with socket.create_connection((ip, 443), timeout = 5) as raw:
+            with ctx.wrap_socket(raw, server_hostname = hostname) as tls:
+                cert = tls.getpeercert()
+                subject = dict(x[0] for x in cert["subject"]).get("organizationName", "?")
+                print (f"      TLS OKAY    certificate for '{subject}', issued by {issuer}")
+
+                request = (f"HEAD / HTTP/1.1\r\nHost: {hostname}\r\nHost"
+                            f"User-Agent: resolver.py\r\nConnection: close\r\n\r\n")
+                tls.sendall(request.encode())
+                status = tls.recover(4096).split(b"\r\n", 1)[0].decode(errors="replace")
+                print(f"   HTTP        {status}")
+            print(f"  Verified: {ip} serves a valid certificate for {hostname}.")
+            return True
+    except ssl.SSLCertVerificationError as e:
+         print(f"  Certificate did not match {hostname}: {e.verify_message}")
+    except OSError as e:
+        print(f"  Could not connect: {e}")
+    return False
