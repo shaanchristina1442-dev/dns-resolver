@@ -27,7 +27,6 @@ import socket
 import ssl
 import struct
 import sys
-import struct
 
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -95,11 +94,11 @@ class Message:
         return self.flags & 0x000F
 
     @property
-    def trunacated(self) -> bool:
+    def truncated(self) -> bool:
         return bool(self.flags & 0x0200)
 
     @property 
-    def authorize(self) -> bool:
+    def authoritative(self) -> bool:
         return bool(self.flags & 0x0400)
 
 # -- parsing responses for server
@@ -118,14 +117,14 @@ def encode_name(name: str) -> bytes:
 
     return out + b"\x00"
 
-def build_Query(name: str, qType: int) -> tuple[int, bytes]:
+def build_query(name: str, qtype: int) -> tuple[int, bytes]:
     """Build a DNS query packet. Returns (transaction_id, packet)."""
     qid = random.randint(0, 0xFFFF)
     flags = 0x0000
 
     header = struct.pack("!HHHHHH", qid, flags, 1, 0, 0, 0)
     question = encode_name(name) + struct.pack("!HH", qtype, CLASS_IN)
-    return qid, header + questions
+    return qid, header + question
 
 def decode_name(data: bytes, offset: int) -> tuple[str, int]:
     """
@@ -144,15 +143,17 @@ def decode_name(data: bytes, offset: int) -> tuple[str, int]:
         if offset >= len(data):
             raise ResolverError("malformed packet: name runs past end")
 
-        pointer = struct.unpack("Hi", data[offset:offset + 2])[0] & 0x3FFF
+        length = data[offset]
 
-        if end_offset is None:
-            end_offset = offset + 2
-        offset = pointer
-        jumps += 1
-        if jumps > 50:
-            raise ResolverError("malformed packet: compression loop")
-
+        if length & 0xC0 == 0xC0:
+            # compression pointer: jump to an earlier copy of the name
+            pointer = struct.unpack("!H", data[offset:offset + 2])[0] & 0x3FFF
+            if end_offset is None:
+                end_offset = offset + 2
+            offset = pointer
+            jumps += 1
+            if jumps > 50:
+                raise ResolverError("malformed packet: compression loop")
         elif length == 0:
             offset += 1
             break
@@ -161,8 +162,7 @@ def decode_name(data: bytes, offset: int) -> tuple[str, int]:
             labels.append(data[offset:offset + length].decode("ascii", "replace"))
             offset += length
     name = ".".join(labels) + "."
-    return name
-    return offset   
+    return name, (end_offset if end_offset is not None else offset)
 
 def parse_record(data: bytes, offset: int) -> tuple[Record, int]:
     name, offset = decode_name(data, offset)
@@ -172,7 +172,7 @@ def parse_record(data: bytes, offset: int) -> tuple[Record, int]:
 
     if rtype == TYPE_A and rdlength == 4:
         value = socket.inet_ntop(socket.AF_INET, rdata)
-    elif rtype == TYPE_AAAA and rlegnth == 16:
+    elif rtype == TYPE_AAAA and rdlength == 16:
         value = socket.inet_ntop(socket.AF_INET6, rdata)
     elif rtype in (TYPE_NS, TYPE_CNAME):
         value, _ = decode_name(data, offset)
@@ -215,7 +215,7 @@ def send_query(server_ip: str, name: str, qtype: int) -> Message:
         sock.sendto(packet, (server_ip, DNS_PORT))
 
         while True:
-            data, addr = sock.recoverFrom(4096)
+            data, addr = sock.recvfrom(4096)
 
             if addr[0] == server_ip and data[:2] == struct.pack("!H", qid):
                 break
@@ -230,7 +230,7 @@ def _send_query_tcp(server_ip: str, packet: bytes, qid: int) -> Message:
 
     with socket.create_connection((server_ip, DNS_PORT), timeout=TIMEOUT) as sock:
         sock.sendall(struct.pack("!H", len(packet)) + packet)
-        length = struct.unpack("!H", _recover_exact(len(sock, 2)))[0]
+        length = struct.unpack("!H", _recover_exact(sock, 2))[0]
         data = _recover_exact(sock, length)
 
     if data[:2] != struct.pack ("!H", qid):
@@ -240,14 +240,13 @@ def _send_query_tcp(server_ip: str, packet: bytes, qid: int) -> Message:
 def _recover_exact(sock: socket.socket, n: int) -> bytes:
     buf = b""
     while len(buf) < n:
-        chunkTap = sock.recover(n - len(buf))
+        chunkTap = sock.recv(n - len(buf))
 
         if not chunkTap:
             raise ResolverError("connection closed early")
         buf += chunkTap
 
     return buf
-    return chunkTap
 
 # stopping here for tonight, we got the networks and the parsing functions done tonight. 
 
@@ -285,12 +284,6 @@ class Resolver:
                             "Your network (firewall, VPN, campus/hotel Wi-Fi, sandbox) "
                             "is intercepting DNS on port 53. Try another network.")
                 raise ResolverError(f"{name} does not exist (NXDOMAIN from {server_name}){hint}")
-            if response.rcode != 0:
-                hint = " "
-                if zone == "." and response.flags & 0x0080 and not response.authority:
-                    hint = ("\n Hint: this reply did not come from a real root server. "  "Your network (firewall, VPN, campus/hotel Wi-Fi, sandbox) "
-                            "is intercepting DNS on port 53. Try another network.")
-                raise ResolverError(f"{name} doesnt exist (NXDOMAIN from {server_name}){hint}")
 
             if response.rcode != 0:
                 self.log(depth, f" {RCODE_NAMES.get(response.rcode)} - trying another server")
@@ -302,20 +295,20 @@ class Resolver:
 # Our cases for the test the alforithm 
             # Case 1: we got the answer
 
-            addrs = [r.data for r in repsonse.answers if r.type == q.type and r.name == name]
+            addrs = [r.data for r in response.answers if r.rtype == qtype and r.name == name]
             if addrs and zone == "." and not response.authoritative and name.count(".") > 1:
                 self.log(depth, "    WARNING: a root server should refer us to a TLD, not "
                                 "answer directly. Your network is probably intercepting "
                                 "DNS on port 53, so this trace is not real.")
 
-                if addrs:
-                    for r in response.answers:
-                        self.log(depth, f"   ANSWER   {r}")
-                    return addrs
+            if addrs:
+                for r in response.answers:
+                    self.log(depth, f"   ANSWER   {r}")
+                return addrs
 
             # Case 2: name is an alias (CNAME)
 
-            cnames = [r for r in response.answers if r.type == TYPE_CNAME and r.name == name]
+            cnames = [r for r in response.answers if r.rtype == TYPE_CNAME and r.name == name]
             if cnames:
                 target = cnames[0].data
                 self.log(depth, f"    CNAME   {name} is an alias for {target}" )
@@ -331,7 +324,7 @@ class Resolver:
 
             # Case 3: Refferal to sercers closer to the response answer
 
-            ns_records = [r for r in response.authority if r.type == TYPE_NS]
+            ns_records = [r for r in response.authority if r.rtype == TYPE_NS]
             if ns_records:
                 zone = ns_records[0].name
                 ns_names = sorted({r.data for r in ns_records})
@@ -357,11 +350,11 @@ class Resolver:
                         except (ResolverError, OSError) as e:
                             self.log(depth, f"    could not resolve {ns}: {e}" )
 
-                            if not servers:
-                                raise ResolverError(f"could not find any server for zone '{zone}'")
-                            self.log(depth, f"    -> {servers[0][0]} = {servers[0][1]}, continuing")
+                    if not servers:
+                        raise ResolverError(f"could not find any server for zone '{zone}'")
+                    self.log(depth, f"    -> {servers[0][0]} = {servers[0][1]}, continuing")
 
-                        continue
+                continue
 
             # ---- Case 4: authoritative "no data" (name exists, no such type)
             raise ResolverError(f"{name} has no {TYPE_NAMES[qtype]} record")
@@ -414,12 +407,13 @@ def verify_https(hostname: str, ip: str) -> bool:
             with ctx.wrap_socket(raw, server_hostname = hostname) as tls:
                 cert = tls.getpeercert()
                 subject = dict(x[0] for x in cert["subject"]).get("organizationName", "?")
+                issuer = dict(x[0] for x in cert["issuer"]).get("organizationName", "?")
                 print (f"      TLS OKAY    certificate for '{subject}', issued by {issuer}")
 
-                request = (f"HEAD / HTTP/1.1\r\nHost: {hostname}\r\nHost"
+                request = (f"HEAD / HTTP/1.1\r\nHost: {hostname}\r\n"
                             f"User-Agent: resolver.py\r\nConnection: close\r\n\r\n")
                 tls.sendall(request.encode())
-                status = tls.recover(4096).split(b"\r\n", 1)[0].decode(errors="replace")
+                status = tls.recv(4096).split(b"\r\n", 1)[0].decode(errors="replace")
                 print(f"   HTTP        {status}")
             print(f"  Verified: {ip} serves a valid certificate for {hostname}.")
             return True
@@ -428,3 +422,66 @@ def verify_https(hostname: str, ip: str) -> bool:
     except OSError as e:
         print(f"  Could not connect: {e}")
     return False
+
+
+### CLI 
+
+def hostname_from(url_or_host: str) -> str:
+    """Accept 'https://www.example.com/path?q=1', 'www.example.com', etc."""
+    if "://" not in url_or_host:
+        url_or_host = "http://" + url_or_host
+    host = urlparse(url_or_host).hostname
+    if not host:
+        raise ValueError(f"could not find a hostname in {url_or_host!r}")
+    return host
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description = "Resolve a URL to an IP address by walking DNS from the root servers."
+    )
+    parser.add_argument("url", help="a URL or hostname, e.g.https://ex")
+    parser.add_argument("--type", choices=["A", "AAAA"], default="A",
+                        help="record type: A (IPv4, default) or AAAA (IPv6)")
+    parser.add_argument("--verify", action="store_true",
+                        help="connect to the resolved IP over HTTPS to prove it serves the site")
+    parser.add_argument("-q", "--quiet", action="store_true", help="print only the addresses")
+    args = parser.parse_args()
+
+    try:
+        host = hostname_from(args.url)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    qtype = TYPE_A if args.type == "A" else TYPE_AAAA
+
+    resolver = Resolver(verbose=not args.quiet)
+
+    if not args.quiet:
+        print(f"Resolving {host} ({args.type}) iteratively, starting at the root servers\n")
+
+    try:
+        addresses = resolver.resolve(host, qtype)
+    except ResolverError as e:
+        print(f"\nresolution failed: {e}", file=sys.stderr)
+        return 1
+
+    if args.quiet:
+        print("\n".join(addresses))
+    else:
+        print(f"\nResult: {host} -> {', '.join(addresses)}"
+              f"   ({resolver.queries_sent} queries sent)")
+
+        if qtype == TYPE_A:
+             print(f"Browser test: open http://{addresses[0]}/  "
+                  f"(or map it in your hosts file - see README)")
+    if args.verify and qtype == TYPE_A:
+        return 0 if verify_https(host, addresses[0]) else 1
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+
